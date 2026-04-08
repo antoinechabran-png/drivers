@@ -37,13 +37,20 @@ def run_rwa(X, y):
 
 # --- UI APP ---
 st.title("📊 Consumer Driver Analysis Suite")
-st.markdown("Upload your Excel file and select variables to begin analysis.")
+st.markdown("Upload your Excel file, select the sheet, and define your variables.")
 
 uploaded_file = st.file_uploader("Choose an Excel file", type="xlsx")
 
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    st.write("### Data Preview", df.head())
+    # 1. NEW: Get sheet names
+    xl = pd.ExcelFile(uploaded_file)
+    sheet_names = xl.sheet_names
+    
+    selected_sheet = st.selectbox("Select the Sheet to Analyze", sheet_names)
+    
+    # 2. Load the specific sheet
+    df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+    st.write(f"### Data Preview: {selected_sheet}", df.head())
     
     col1, col2 = st.columns(2)
     with col1:
@@ -73,7 +80,6 @@ if uploaded_file:
         # --- TAB 2: SHAPLEY VALUES ---
         with tab2:
             st.subheader("Shapley Value Regression")
-            # Using a simple Linear Explainer for speed
             explainer = shap.LinearExplainer(model, X)
             shap_values = explainer.shap_values(X)
             vals = np.abs(shap_values).mean(0)
@@ -85,9 +91,9 @@ if uploaded_file:
         # --- TAB 3: PENALTY ANALYSIS ---
         with tab3:
             st.subheader("Penalty Analysis for CATA")
-            cata_format = st.radio("CATA Data Format", ["0 (No) / 1 (Yes)", "1 (No) / 2 (Yes)"])
+            cata_format = st.radio("CATA Data Format", ["0 (No) / 1 (Yes)", "1 (No) / 2 (Yes)"], help="Format of your binary data")
             
-            # Normalize to 0/1
+            # Normalize to 0 (No) and 1 (Yes)
             X_cata = X.copy()
             if cata_format == "1 (No) / 2 (Yes)":
                 X_cata = X_cata - 1
@@ -102,8 +108,16 @@ if uploaded_file:
                     penalty_results.append({'Attribute': col, 'Mean Drop/Gain': mean_drop, '% Checked': pct_checked})
             
             penalty_df = pd.DataFrame(penalty_results)
-            fig_pen = px.scatter(penalty_df, x='% Checked', y='Mean Drop/Gain', text='Attribute', title="Penalty/Reward Map")
-            st.plotly_chart(fig_pen)
+            if not penalty_df.empty:
+                fig_pen = px.scatter(penalty_df, x='% Checked', y='Mean Drop/Gain', text='Attribute', 
+                                   title="Penalty/Reward Map", size_max=60)
+                fig_pen.update_traces(textposition='top center')
+                # Add a zero line for visual reference
+                fig_pen.add_hline(y=0, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig_pen)
+                st.write(penalty_df)
+            else:
+                st.warning("No binary variation found in selected features.")
 
         # --- TAB 4: PATH ANALYSIS ---
         with tab4:
@@ -113,19 +127,29 @@ if uploaded_file:
             path_syntax = st.text_area("semopy Syntax", value=default_path)
             
             if st.button("Run Path Analysis"):
-                sem = Model(path_syntax)
-                sem.fit(data)
-                estimates = sem.inspect()
-                st.write(estimates)
+                try:
+                    sem = Model(path_syntax)
+                    sem.fit(data)
+                    estimates = sem.inspect()
+                    st.write(estimates)
+                except Exception as e:
+                    st.error(f"Error in SEM syntax or data: {e}")
 
         # --- TAB 5: EXPORT ---
         with tab5:
             st.subheader("Export Results to Excel")
+            # Creating a summary of the Linear Regression
+            reg_summary = pd.DataFrame({
+                "Coeff": model.params,
+                "P-Value": model.pvalues,
+                "Std Error": model.bse
+            })
+            
             results_dict = {
-                "Regression_Summary": pd.DataFrame(model.params, columns=['Coeff']),
+                "Regression_Summary": reg_summary,
                 "RWA_Importance": rwa_results,
                 "Shapley_Importance": shap_df,
                 "Penalty_Analysis": penalty_df
             }
             excel_data = to_excel(results_dict)
-            st.download_button(label="📥 Download All Analyses", data=excel_data, file_name="driver_analysis_results.xlsx")
+            st.download_button(label="📥 Download All Analyses", data=excel_data, file_name=f"{selected_sheet}_analysis_results.xlsx")
