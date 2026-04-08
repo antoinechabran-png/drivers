@@ -21,11 +21,9 @@ def to_excel(df_dict):
     return output.getvalue()
 
 def sanitize_name(name):
-    """Replaces all non-alphanumeric characters with underscores for SEM compatibility."""
     return re.sub(r'[^a-zA-Z0-9]', '_', str(name))
 
 def run_rwa(X, y):
-    """Relative Weight Analysis: Decomposition of R-squared."""
     corr_matrix = X.corr()
     eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
     eigenvalues = np.maximum(eigenvalues, 1e-10)
@@ -47,62 +45,59 @@ if uploaded_file:
     selected_sheet = st.selectbox("Select Sheet", xl.sheet_names)
     df_raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
     
-    # SANITIZATION: Clean names for processing
+    # Sanitize names immediately
     df = df_raw.copy()
     df.columns = [sanitize_name(c) for c in df.columns]
     
+    # --- STEP 0: SUB-TARGET FILTERING ---
+    st.sidebar.header("0. Sub-Target Filtering")
+    filter_col = st.sidebar.selectbox("Select Filter Question", ["No Filter"] + list(df.columns))
+    
+    working_df = df.copy()
+    if filter_col != "No Filter":
+        unique_vals = sorted(df[filter_col].dropna().unique().tolist())
+        selected_codes = st.sidebar.multiselect(f"Select Codes for {filter_col}", unique_vals)
+        if selected_codes:
+            working_df = df[df[filter_col].isin(selected_codes)]
+            st.sidebar.success(f"Filter applied: {len(working_df)} rows remaining.")
+        else:
+            st.sidebar.warning("No codes selected: using full sample.")
+
+    # --- STEP 1: VARIABLE SELECTION ---
     st.sidebar.header("1. Variable Selection")
-    target = st.sidebar.selectbox("Variable to Explain (Target)", df.columns)
+    target = st.sidebar.selectbox("Variable to Explain (Target)", working_df.columns)
     
-    # --- TICK-BOX SYSTEM FOR DRIVERS ---
     st.sidebar.write("Select Explanatory Variables (Drivers):")
-    available_drivers = [c for c in df.columns if c != target]
+    available_drivers = [c for c in working_df.columns if c != target]
+    selection_df = pd.DataFrame({"Select": [False] * len(available_drivers), "Driver_Variable": available_drivers})
     
-    # Create a selection dataframe
-    selection_df = pd.DataFrame({
-        "Select": [False] * len(available_drivers),
-        "Driver_Variable": available_drivers
-    })
-    
-    # Display the interactive tick-box table
     edited_df = st.sidebar.data_editor(
-        selection_df,
-        hide_index=True,
-        column_config={
-            "Select": st.column_config.CheckboxColumn(required=True),
-            "Driver_Variable": st.column_config.TextColumn(disabled=True)
-        },
+        selection_df, hide_index=True,
+        column_config={"Select": st.column_config.CheckboxColumn(required=True), "Driver_Variable": st.column_config.TextColumn(disabled=True)},
         use_container_width=True
     )
-    
-    # Get list of features where 'Select' is True
     features = edited_df[edited_df["Select"] == True]["Driver_Variable"].tolist()
     
+    # --- STEP 2: ANALYSIS SELECTION ---
     st.sidebar.header("2. Analysis Selection")
-    analysis_types = st.sidebar.multiselect(
-        "Choose Analyses to Perform", 
-        ["Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)", "Path Analysis"],
-        default=[],
-        placeholder="Choose options..."
-    )
+    analysis_options = ["Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)", "Kano Analysis", "Path Analysis"]
+    analysis_types = st.sidebar.multiselect("Choose Analyses", analysis_options, default=[], placeholder="Choose options...")
 
     if target and features and analysis_types:
-        data = df[[target] + features].dropna()
+        data = working_df[[target] + features].dropna()
         y = data[target]
         X = data[features]
         X_with_const = sm.add_constant(X)
         model = sm.OLS(y, X_with_const).fit()
 
-        # --- HIGHLIGHTS SECTION ---
-        st.info("### 💡 Significant Driver Highlights")
+        st.info(f"### 💡 Insights for Sub-Target (N={len(data)})")
         p_values = model.pvalues.iloc[1:]
         significant = p_values[p_values < 0.05].sort_values()
-        
         if not significant.empty:
             for var, pval in significant.items():
                 st.markdown(f"- ✅ **{var}** (p-value: {pval:.4f})")
         else:
-            st.write("No variables reached the 95% significance threshold.")
+            st.write("No variables reached significance for this sub-target.")
         
         st.divider()
 
@@ -124,17 +119,6 @@ if uploaded_file:
                     st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h'))
                     results_to_export["RWA"] = rwa_df
 
-                elif analysis == "Shapley Values":
-                    st.subheader("Shapley Value Importance")
-                    try:
-                        explainer = shap.LinearExplainer((model.params.iloc[1:].values, model.params.iloc[0]), X)
-                        shap_values = explainer.shap_values(X)
-                        shap_df = pd.DataFrame({'Driver': features, 'Importance': np.abs(shap_values).mean(0)}).sort_values(by='Importance', ascending=False)
-                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance'))
-                        results_to_export["Shapley"] = shap_df
-                    except Exception as e:
-                        st.error(f"Shapley Error: {e}")
-
                 elif analysis == "Penalty Analysis (CATA)":
                     st.subheader("CATA Penalty Analysis")
                     cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
@@ -149,6 +133,27 @@ if uploaded_file:
                         st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40))
                         results_to_export["Penalty"] = pen_df
 
+                elif analysis == "Kano Analysis":
+                    st.subheader("Kano Strategic Classification")
+                    # Calculate Potential for Satisfaction (Reward) and Dissatisfaction (Penalty)
+                    kano_list = []
+                    for col in features:
+                        reward = y[X[col] >= X[col].median()].mean() - y.mean()
+                        penalty = y.mean() - y[X[col] < X[col].median()].mean()
+                        
+                        # Classification logic
+                        if reward > penalty and reward > 0.1: cat = "Delighter (Attractive)"
+                        elif penalty > reward and penalty > 0.1: cat = "Must-have (Basic)"
+                        elif abs(reward - penalty) < 0.1 and reward > 0.1: cat = "Linear (Performance)"
+                        else: cat = "Indifferent"
+                        
+                        kano_list.append({'Driver': col, 'Reward Potential': reward, 'Penalty Potential': penalty, 'Category': cat})
+                    
+                    kano_df = pd.DataFrame(kano_list)
+                    st.plotly_chart(px.scatter(kano_df, x='Penalty Potential', y='Reward Potential', color='Category', text='Driver', title="Kano Map"))
+                    st.table(kano_df)
+                    results_to_export["Kano"] = kano_df
+
                 elif analysis == "Path Analysis":
                     st.subheader("Path Analysis (SEM)")
                     path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}")
@@ -158,20 +163,14 @@ if uploaded_file:
                             sem.fit(data)
                             res = sem.inspect()
                             paths = res[res['op'] == '~']
-                            
-                            # Sankey Visual
                             labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
                             fig = go.Figure(data=[go.Sankey(
-                                node = dict(pad = 15, thickness = 20, line = dict(color = "black", width = 0.5), label = labels, color = "blue"),
-                                link = dict(
-                                  source = [labels.index(x) for x in paths['rval']],
-                                  target = [labels.index(x) for x in paths['lval']],
-                                  value = np.abs(paths['Estimate']).tolist(),
-                                  label = paths['Estimate'].round(3).astype(str).tolist()
-                                ))])
-                            
+                                node = dict(pad=15, thickness=20, label=labels, color="blue"),
+                                link = dict(source=[labels.index(x) for x in paths['rval']],
+                                           target=[labels.index(x) for x in paths['lval']],
+                                           value=np.abs(paths['Estimate']).tolist(),
+                                           label=paths['Estimate'].round(3).astype(str).tolist()))])
                             st.plotly_chart(fig, use_container_width=True)
-                            st.write("### Statistical Details", res.sort_values(by='Estimate', ascending=False))
                             results_to_export["Path"] = res
                         except Exception as e:
                             st.error(f"SEM Error: {e}")
@@ -180,8 +179,6 @@ if uploaded_file:
             st.subheader("Download Results")
             if results_to_export:
                 xlsx_data = to_excel(results_to_export)
-                st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "driver_analysis.xlsx")
-            else:
-                st.warning("Please perform an analysis first.")
+                st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "subtarget_analysis.xlsx")
     else:
-        st.info("👈 Use the sidebar to select your Target, tick your Drivers, and choose an Analysis type.")
+        st.info("👈 Complete the sidebar steps to begin.")
