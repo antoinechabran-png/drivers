@@ -4,7 +4,6 @@ import numpy as np
 import statsmodels.api as sm
 import shap
 import plotly.express as px
-import plotly.graph_objects as go
 from io import BytesIO
 from semopy import Model
 
@@ -20,7 +19,7 @@ def to_excel(df_dict):
     return output.getvalue()
 
 def run_rwa(X, y):
-    """Simple Relative Weight Analysis implementation via correlation transformation."""
+    """Relative Weight Analysis: Decomposition of R-squared."""
     corr_matrix = X.corr()
     eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
     eigenvalues = np.maximum(eigenvalues, 1e-10)
@@ -28,127 +27,117 @@ def run_rwa(X, y):
     delta = eigenvectors @ diagonal_sqrt_evals @ eigenvectors.T
     transformed_X = np.linalg.inv(delta) @ X.T
     model = sm.OLS(y, sm.add_constant(transformed_X.T)).fit()
-    # Use .iloc[1:] to skip the constant correctly
     raw_weights = (delta**2) @ (model.params.iloc[1:].values**2)
     rescaled_weights = (raw_weights / raw_weights.sum()) * 100
-    return pd.DataFrame({'Driver': X.columns, 'Relative Weight (%)': rescaled_weights})
+    return pd.DataFrame({'Driver': X.columns, 'Weight (%)': rescaled_weights}).sort_values(by='Weight (%)', ascending=False)
 
 # --- UI APP ---
 st.title("📊 Consumer Driver Analysis Suite")
 
-uploaded_file = st.file_uploader("Choose an Excel file", type="xlsx")
+uploaded_file = st.file_uploader("Upload Excel File", type="xlsx")
 
 if uploaded_file:
     xl = pd.ExcelFile(uploaded_file)
-    sheet_names = xl.sheet_names
-    selected_sheet = st.selectbox("Select the Sheet to Analyze", sheet_names)
-    
+    selected_sheet = st.selectbox("Select Sheet", xl.sheet_names)
     df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
-    # Clean names for SEM compatibility
     df.columns = [str(c).replace(' ', '_').replace('.', '_') for c in df.columns]
     
-    st.write(f"### Data Preview", df.head())
+    st.sidebar.header("Settings")
+    target = st.sidebar.selectbox("Variable to Explain (Target)", df.columns)
+    features = st.sidebar.multiselect("Explanatory Variables (Drivers)", [c for c in df.columns if c != target])
     
-    col1, col2 = st.columns(2)
-    with col1:
-        target = st.selectbox("Select Target Variable", df.columns)
-    with col2:
-        features = st.multiselect("Select Driver Variables", [c for c in df.columns if c != target])
-    
+    analysis_types = st.sidebar.multiselect(
+        "Choose Analyses to Perform", 
+        ["Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)", "Path Analysis"],
+        default=["Linear Regression", "RWA"]
+    )
+
     if target and features:
         data = df[[target] + features].dropna()
         y = data[target]
         X = data[features]
+        X_with_const = sm.add_constant(X)
+        model = sm.OLS(y, X_with_const).fit()
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Linear Reg & RWA", "Shapley Values", "Penalty Analysis (CATA)", "Path Analysis", "Export"])
+        # --- HIGHLIGHTS SECTION ---
+        st.info("### 💡 Significant Driver Highlights")
+        p_values = model.pvalues.iloc[1:]
+        significant = p_values[p_values < 0.05].index.tolist()
+        if significant:
+            st.write(f"Based on Linear Regression, the following variables have a **significant** ($p < 0.05$) impact on **{target}**:")
+            for s in significant:
+                st.markdown(f"- ✅ **{s}** (p-value: {model.pvalues[s]:.4f})")
+        else:
+            st.write("No variables reached the 95% significance threshold.")
+        
+        st.divider()
 
-        # --- TAB 1: REGRESSION & RWA ---
-        with tab1:
-            st.subheader("Linear Regression & RWA")
-            X_with_const = sm.add_constant(X)
-            model = sm.OLS(y, X_with_const).fit()
-            
-            rwa_results = run_rwa(X, y)
-            st.plotly_chart(px.bar(rwa_results, x='Driver', y='Relative Weight (%)'))
-            st.write(model.summary())
+        # Display tabs based on selection
+        tabs = st.tabs([a for a in analysis_types] + ["Export"])
+        
+        results_to_export = {}
 
-        # --- TAB 2: SHAPLEY VALUES ---
-        with tab2:
-            st.subheader("Shapley Value Regression")
-            # FIXED: Using .iloc to access values by position to avoid KeyError
-            coefs = model.params.iloc[1:].values 
-            intercept = model.params.iloc[0]
-            
-            try:
-                # We use a LinearExplainer with a custom model tuple
-                explainer = shap.LinearExplainer((coefs, intercept), X)
-                shap_values = explainer.shap_values(X)
-                
-                vals = np.abs(shap_values).mean(0)
-                shap_df = pd.DataFrame({'Driver': features, 'Mean |Shapley Value|': vals}).sort_values(by='Mean |Shapley Value|', ascending=False)
-                
-                st.plotly_chart(px.bar(shap_df, x='Mean |Shapley Value|', y='Driver', orientation='h'))
-            except Exception as e:
-                st.error(f"SHAP calculation failed: {e}")
-                shap_df = pd.DataFrame()
+        for i, analysis in enumerate(analysis_types):
+            with tabs[i]:
+                if analysis == "Linear Regression":
+                    st.subheader("Linear Regression (Standardized Coefficients)")
+                    # Standardize coefficients to compare scale
+                    std_coefs = model.params.iloc[1:] * (X.std() / y.std())
+                    reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
+                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score'))
+                    results_to_export["Regression"] = reg_df
 
-        # --- TAB 3: PENALTY ANALYSIS ---
-        with tab3:
-            st.subheader("Penalty Analysis for CATA")
-            cata_format = st.radio("CATA Data Format", ["0 (No) / 1 (Yes)", "1 (No) / 2 (Yes)"])
-            
-            X_cata = X.copy()
-            if cata_format == "1 (No) / 2 (Yes)":
-                X_cata = X_cata - 1
-            
-            penalty_results = []
-            for col in features:
-                # Basic check to see if column is binary
-                unique_vals = X_cata[col].unique()
-                if 1 in unique_vals and 0 in unique_vals:
-                    group_yes = y[X_cata[col] == 1]
-                    group_no = y[X_cata[col] == 0]
-                    mean_impact = group_yes.mean() - group_no.mean()
-                    pct_checked = (X_cata[col].sum() / len(X_cata)) * 100
-                    penalty_results.append({'Attribute': col, 'Mean Impact': mean_impact, '% Checked': pct_checked})
-            
-            penalty_df = pd.DataFrame(penalty_results)
-            if not penalty_df.empty:
-                fig_pen = px.scatter(penalty_df, x='% Checked', y='Mean Impact', text='Attribute')
-                fig_pen.add_hline(y=0, line_dash="dash")
-                st.plotly_chart(fig_pen)
+                elif analysis == "RWA":
+                    st.subheader("Relative Weight Analysis (RWA)")
+                    rwa_df = run_rwa(X, y)
+                    st.plotly_chart(px.pie(rwa_df, values='Weight (%)', names='Driver', title="Share of Explained Variance"))
+                    st.write(rwa_df)
+                    results_to_export["RWA"] = rwa_df
+
+                elif analysis == "Shapley Values":
+                    st.subheader("Shapley Value Importance")
+                    try:
+                        explainer = shap.LinearExplainer((model.params.iloc[1:].values, model.params.iloc[0]), X)
+                        shap_values = explainer.shap_values(X)
+                        shap_df = pd.DataFrame({'Driver': features, 'Importance': np.abs(shap_values).mean(0)}).sort_values(by='Importance', ascending=False)
+                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance'))
+                        results_to_export["Shapley"] = shap_df
+                    except Exception as e:
+                        st.error(f"Shapley Error: {e}")
+
+                elif analysis == "Penalty Analysis (CATA)":
+                    st.subheader("CATA Penalty Analysis")
+                    cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
+                    X_cata = X.copy() - 1 if cata_format == "1/2" else X.copy()
+                    
+                    pen_list = []
+                    for col in features:
+                        if set(X_cata[col].unique()).issubset({0, 1}):
+                            diff = y[X_cata[col]==1].mean() - y[X_cata[col]==0].mean()
+                            pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean()*100)})
+                    
+                    pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
+                    if not pen_df.empty:
+                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size='% Checked', color='Mean Difference'))
+                        results_to_export["Penalty"] = pen_df
+
+                elif analysis == "Path Analysis":
+                    st.subheader("Structural Equation Modeling (Path)")
+                    path_syntax = st.text_area("Syntax (Outcome ~ Driver)", value=f"{target} ~ {' + '.join(features[:3])}")
+                    if st.button("Run Path Model"):
+                        try:
+                            sem = Model(path_syntax)
+                            sem.fit(data)
+                            res = sem.inspect().sort_values(by='Estimate', ascending=False)
+                            st.write(res)
+                            results_to_export["Path"] = res
+                        except Exception as e:
+                            st.error(f"SEM Syntax Error: {e}")
+
+        with tabs[-1]:
+            st.subheader("Download Results")
+            if results_to_export:
+                xlsx_data = to_excel(results_to_export)
+                st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "driver_analysis.xlsx")
             else:
-                st.warning("No valid 0/1 data found in drivers for Penalty Analysis.")
-
-        # --- TAB 4: PATH ANALYSIS ---
-        with tab4:
-            st.subheader("Path Analysis (SEM)")
-            st.info("Example: Outcome ~ Driver1 + Driver2")
-            path_syntax = st.text_area("semopy Syntax", value=f"{target} ~ {' + '.join(features[:2])}")
-            
-            if st.button("Run SEM"):
-                try:
-                    sem = Model(path_syntax)
-                    sem.fit(data)
-                    st.write(sem.inspect())
-                except Exception as e:
-                    st.error(f"SEM Syntax Error: {e}")
-
-        # --- TAB 5: EXPORT ---
-        with tab5:
-            st.subheader("Export to Excel")
-            # Build regression table for export
-            reg_export = pd.DataFrame({
-                "Coefficient": model.params,
-                "P-Value": model.pvalues
-            })
-            
-            results_dict = {
-                "Regression": reg_export,
-                "RWA": rwa_results,
-                "Shapley": shap_df if 'shap_df' in locals() else pd.DataFrame(),
-                "Penalty": penalty_df if 'penalty_df' in locals() else pd.DataFrame()
-            }
-            
-            excel_bin = to_excel(results_dict)
-            st.download_button("📥 Download Results", excel_bin, f"analysis_{selected_sheet}.xlsx")
+                st.warning("Perform an analysis first to enable export.")
