@@ -6,6 +6,7 @@ import shap
 import plotly.express as px
 from io import BytesIO
 from semopy import Model
+import re
 
 st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 
@@ -17,6 +18,10 @@ def to_excel(df_dict):
             if df is not None and not df.empty:
                 df.to_excel(writer, sheet_name=sheet_name, index=True)
     return output.getvalue()
+
+def sanitize_name(name):
+    """Replaces all non-alphanumeric characters with underscores for SEM compatibility."""
+    return re.sub(r'[^a-zA-Z0-9]', '_', str(name))
 
 def run_rwa(X, y):
     """Relative Weight Analysis: Decomposition of R-squared."""
@@ -39,34 +44,48 @@ uploaded_file = st.file_uploader("Upload Excel File", type="xlsx")
 if uploaded_file:
     xl = pd.ExcelFile(uploaded_file)
     selected_sheet = st.selectbox("Select Sheet", xl.sheet_names)
-    df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
-    df.columns = [str(c).replace(' ', '_').replace('.', '_') for c in df.columns]
+    df_raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
     
-    st.sidebar.header("Settings")
+    # SANITIZATION: Fixes the SEM Syntax Error by cleaning column names
+    df = df_raw.copy()
+    df.columns = [sanitize_name(c) for c in df.columns]
+    
+    st.sidebar.header("1. Variable Selection")
     target = st.sidebar.selectbox("Variable to Explain (Target)", df.columns)
-    features = st.sidebar.multiselect("Explanatory Variables (Drivers)", [c for c in df.columns if c != target])
     
+    # Multiselect allows selecting multiple drivers at once
+    features = st.sidebar.multiselect(
+        "Explanatory Variables (Drivers)", 
+        [c for c in df.columns if c != target],
+        help="You can click or type to add multiple variables here."
+    )
+    
+    st.sidebar.header("2. Analysis Selection")
     analysis_types = st.sidebar.multiselect(
         "Choose Analyses to Perform", 
         ["Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)", "Path Analysis"],
-        default=["Linear Regression", "RWA"]
+        default=[],  # No analysis selected by default
+        placeholder="Choose options..."
     )
 
-    if target and features:
+    if target and features and analysis_types:
         data = df[[target] + features].dropna()
         y = data[target]
         X = data[features]
+        
+        # Pre-fit standard model for global use
         X_with_const = sm.add_constant(X)
         model = sm.OLS(y, X_with_const).fit()
 
         # --- HIGHLIGHTS SECTION ---
         st.info("### 💡 Significant Driver Highlights")
         p_values = model.pvalues.iloc[1:]
-        significant = p_values[p_values < 0.05].index.tolist()
-        if significant:
-            st.write(f"Based on Linear Regression, the following variables have a **significant** ($p < 0.05$) impact on **{target}**:")
-            for s in significant:
-                st.markdown(f"- ✅ **{s}** (p-value: {model.pvalues[s]:.4f})")
+        significant = p_values[p_values < 0.05].sort_values()
+        
+        if not significant.empty:
+            st.write(f"The following variables are statistically **significant** drivers ($p < 0.05$):")
+            for var, pval in significant.items():
+                st.markdown(f"- ✅ **{var}** (p-value: {pval:.4f})")
         else:
             st.write("No variables reached the 95% significance threshold.")
         
@@ -74,24 +93,21 @@ if uploaded_file:
 
         # Display tabs based on selection
         tabs = st.tabs([a for a in analysis_types] + ["Export"])
-        
         results_to_export = {}
 
         for i, analysis in enumerate(analysis_types):
             with tabs[i]:
                 if analysis == "Linear Regression":
                     st.subheader("Linear Regression (Standardized Coefficients)")
-                    # Standardize coefficients to compare scale
                     std_coefs = model.params.iloc[1:] * (X.std() / y.std())
                     reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
-                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score'))
+                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', title="Sorted Driver Impact"))
                     results_to_export["Regression"] = reg_df
 
                 elif analysis == "RWA":
                     st.subheader("Relative Weight Analysis (RWA)")
                     rwa_df = run_rwa(X, y)
-                    st.plotly_chart(px.pie(rwa_df, values='Weight (%)', names='Driver', title="Share of Explained Variance"))
-                    st.write(rwa_df)
+                    st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h', title="Sorted Contribution to R-Squared"))
                     results_to_export["RWA"] = rwa_df
 
                 elif analysis == "Shapley Values":
@@ -100,7 +116,7 @@ if uploaded_file:
                         explainer = shap.LinearExplainer((model.params.iloc[1:].values, model.params.iloc[0]), X)
                         shap_values = explainer.shap_values(X)
                         shap_df = pd.DataFrame({'Driver': features, 'Importance': np.abs(shap_values).mean(0)}).sort_values(by='Importance', ascending=False)
-                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance'))
+                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance', title="Sorted Shapley Importance"))
                         results_to_export["Shapley"] = shap_df
                     except Exception as e:
                         st.error(f"Shapley Error: {e}")
@@ -112,18 +128,20 @@ if uploaded_file:
                     
                     pen_list = []
                     for col in features:
-                        if set(X_cata[col].unique()).issubset({0, 1}):
+                        unique_vals = X_cata[col].unique()
+                        if 0 in unique_vals and 1 in unique_vals:
                             diff = y[X_cata[col]==1].mean() - y[X_cata[col]==0].mean()
                             pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean()*100)})
                     
                     pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
                     if not pen_df.empty:
-                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size='% Checked', color='Mean Difference'))
+                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40, title="Penalty/Reward Map"))
                         results_to_export["Penalty"] = pen_df
 
                 elif analysis == "Path Analysis":
-                    st.subheader("Structural Equation Modeling (Path)")
-                    path_syntax = st.text_area("Syntax (Outcome ~ Driver)", value=f"{target} ~ {' + '.join(features[:3])}")
+                    st.subheader("Path Analysis (SEM)")
+                    # The value now uses sanitized names automatically
+                    path_syntax = st.text_area("Syntax (Outcome ~ Driver)", value=f"{target} ~ {' + '.join(features)}")
                     if st.button("Run Path Model"):
                         try:
                             sem = Model(path_syntax)
@@ -132,7 +150,7 @@ if uploaded_file:
                             st.write(res)
                             results_to_export["Path"] = res
                         except Exception as e:
-                            st.error(f"SEM Syntax Error: {e}")
+                            st.error(f"SEM Syntax Error: {e}\n\nHint: Check if your syntax follows the 'Outcome ~ Driver1 + Driver2' format.")
 
         with tabs[-1]:
             st.subheader("Download Results")
@@ -140,4 +158,6 @@ if uploaded_file:
                 xlsx_data = to_excel(results_to_export)
                 st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "driver_analysis.xlsx")
             else:
-                st.warning("Perform an analysis first to enable export.")
+                st.warning("Please perform at least one analysis to enable export.")
+    else:
+        st.info("Please select a target, at least one driver, and an analysis type in the sidebar to begin.")
