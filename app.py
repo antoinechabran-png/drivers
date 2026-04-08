@@ -4,6 +4,7 @@ import numpy as np
 import statsmodels.api as sm
 import shap
 import plotly.express as px
+import plotly.graph_objects as go
 from io import BytesIO
 from semopy import Model
 import re
@@ -46,25 +47,21 @@ if uploaded_file:
     selected_sheet = st.selectbox("Select Sheet", xl.sheet_names)
     df_raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
     
-    # SANITIZATION: Fixes the SEM Syntax Error by cleaning column names
     df = df_raw.copy()
     df.columns = [sanitize_name(c) for c in df.columns]
     
     st.sidebar.header("1. Variable Selection")
     target = st.sidebar.selectbox("Variable to Explain (Target)", df.columns)
-    
-    # Multiselect allows selecting multiple drivers at once
     features = st.sidebar.multiselect(
         "Explanatory Variables (Drivers)", 
-        [c for c in df.columns if c != target],
-        help="You can click or type to add multiple variables here."
+        [c for c in df.columns if c != target]
     )
     
     st.sidebar.header("2. Analysis Selection")
     analysis_types = st.sidebar.multiselect(
         "Choose Analyses to Perform", 
         ["Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)", "Path Analysis"],
-        default=[],  # No analysis selected by default
+        default=[],
         placeholder="Choose options..."
     )
 
@@ -72,8 +69,6 @@ if uploaded_file:
         data = df[[target] + features].dropna()
         y = data[target]
         X = data[features]
-        
-        # Pre-fit standard model for global use
         X_with_const = sm.add_constant(X)
         model = sm.OLS(y, X_with_const).fit()
 
@@ -83,7 +78,6 @@ if uploaded_file:
         significant = p_values[p_values < 0.05].sort_values()
         
         if not significant.empty:
-            st.write(f"The following variables are statistically **significant** drivers ($p < 0.05$):")
             for var, pval in significant.items():
                 st.markdown(f"- ✅ **{var}** (p-value: {pval:.4f})")
         else:
@@ -91,7 +85,6 @@ if uploaded_file:
         
         st.divider()
 
-        # Display tabs based on selection
         tabs = st.tabs([a for a in analysis_types] + ["Export"])
         results_to_export = {}
 
@@ -101,13 +94,13 @@ if uploaded_file:
                     st.subheader("Linear Regression (Standardized Coefficients)")
                     std_coefs = model.params.iloc[1:] * (X.std() / y.std())
                     reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
-                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', title="Sorted Driver Impact"))
+                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score'))
                     results_to_export["Regression"] = reg_df
 
                 elif analysis == "RWA":
                     st.subheader("Relative Weight Analysis (RWA)")
                     rwa_df = run_rwa(X, y)
-                    st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h', title="Sorted Contribution to R-Squared"))
+                    st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h'))
                     results_to_export["RWA"] = rwa_df
 
                 elif analysis == "Shapley Values":
@@ -116,7 +109,7 @@ if uploaded_file:
                         explainer = shap.LinearExplainer((model.params.iloc[1:].values, model.params.iloc[0]), X)
                         shap_values = explainer.shap_values(X)
                         shap_df = pd.DataFrame({'Driver': features, 'Importance': np.abs(shap_values).mean(0)}).sort_values(by='Importance', ascending=False)
-                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance', title="Sorted Shapley Importance"))
+                        st.plotly_chart(px.bar(shap_df, x='Importance', y='Driver', orientation='h', color='Importance'))
                         results_to_export["Shapley"] = shap_df
                     except Exception as e:
                         st.error(f"Shapley Error: {e}")
@@ -125,39 +118,50 @@ if uploaded_file:
                     st.subheader("CATA Penalty Analysis")
                     cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
                     X_cata = X.copy() - 1 if cata_format == "1/2" else X.copy()
-                    
                     pen_list = []
                     for col in features:
-                        unique_vals = X_cata[col].unique()
-                        if 0 in unique_vals and 1 in unique_vals:
+                        if 0 in X_cata[col].values and 1 in X_cata[col].values:
                             diff = y[X_cata[col]==1].mean() - y[X_cata[col]==0].mean()
                             pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean()*100)})
-                    
                     pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
                     if not pen_df.empty:
-                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40, title="Penalty/Reward Map"))
+                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40))
                         results_to_export["Penalty"] = pen_df
 
                 elif analysis == "Path Analysis":
                     st.subheader("Path Analysis (SEM)")
-                    # The value now uses sanitized names automatically
-                    path_syntax = st.text_area("Syntax (Outcome ~ Driver)", value=f"{target} ~ {' + '.join(features)}")
+                    path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}")
                     if st.button("Run Path Model"):
                         try:
                             sem = Model(path_syntax)
                             sem.fit(data)
-                            res = sem.inspect().sort_values(by='Estimate', ascending=False)
-                            st.write(res)
+                            res = sem.inspect()
+                            
+                            # Filtering only regression paths (op is '~')
+                            paths = res[res['op'] == '~']
+                            
+                            # Visualizing using a Plotly Sankey/Flow Diagram
+                            fig = go.Figure(data=[go.Sankey(
+                                node = dict(
+                                  pad = 15, thickness = 20, line = dict(color = "black", width = 0.5),
+                                  label = list(set(paths['lval'].tolist() + paths['rval'].tolist())),
+                                  color = "blue"
+                                ),
+                                link = dict(
+                                  source = [list(set(paths['lval'].tolist() + paths['rval'].tolist())).index(x) for x in paths['rval']],
+                                  target = [list(set(paths['lval'].tolist() + paths['rval'].tolist())).index(x) for x in paths['lval']],
+                                  value = np.abs(paths['Estimate']).tolist(),
+                                  label = paths['Estimate'].round(3).astype(str).tolist()
+                                ))])
+                            
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.write("### Statistical Details", res.sort_values(by='Estimate', ascending=False))
                             results_to_export["Path"] = res
                         except Exception as e:
-                            st.error(f"SEM Syntax Error: {e}\n\nHint: Check if your syntax follows the 'Outcome ~ Driver1 + Driver2' format.")
+                            st.error(f"SEM Error: {e}")
 
         with tabs[-1]:
             st.subheader("Download Results")
             if results_to_export:
                 xlsx_data = to_excel(results_to_export)
                 st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "driver_analysis.xlsx")
-            else:
-                st.warning("Please perform at least one analysis to enable export.")
-    else:
-        st.info("Please select a target, at least one driver, and an analysis type in the sidebar to begin.")
