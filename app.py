@@ -47,15 +47,36 @@ if uploaded_file:
     selected_sheet = st.selectbox("Select Sheet", xl.sheet_names)
     df_raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
     
+    # SANITIZATION: Clean names for processing
     df = df_raw.copy()
     df.columns = [sanitize_name(c) for c in df.columns]
     
     st.sidebar.header("1. Variable Selection")
     target = st.sidebar.selectbox("Variable to Explain (Target)", df.columns)
-    features = st.sidebar.multiselect(
-        "Explanatory Variables (Drivers)", 
-        [c for c in df.columns if c != target]
+    
+    # --- TICK-BOX SYSTEM FOR DRIVERS ---
+    st.sidebar.write("Select Explanatory Variables (Drivers):")
+    available_drivers = [c for c in df.columns if c != target]
+    
+    # Create a selection dataframe
+    selection_df = pd.DataFrame({
+        "Select": [False] * len(available_drivers),
+        "Driver_Variable": available_drivers
+    })
+    
+    # Display the interactive tick-box table
+    edited_df = st.sidebar.data_editor(
+        selection_df,
+        hide_index=True,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(required=True),
+            "Driver_Variable": st.column_config.TextColumn(disabled=True)
+        },
+        use_container_width=True
     )
+    
+    # Get list of features where 'Select' is True
+    features = edited_df[edited_df["Select"] == True]["Driver_Variable"].tolist()
     
     st.sidebar.header("2. Analysis Selection")
     analysis_types = st.sidebar.multiselect(
@@ -136,20 +157,15 @@ if uploaded_file:
                             sem = Model(path_syntax)
                             sem.fit(data)
                             res = sem.inspect()
-                            
-                            # Filtering only regression paths (op is '~')
                             paths = res[res['op'] == '~']
                             
-                            # Visualizing using a Plotly Sankey/Flow Diagram
+                            # Sankey Visual
+                            labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
                             fig = go.Figure(data=[go.Sankey(
-                                node = dict(
-                                  pad = 15, thickness = 20, line = dict(color = "black", width = 0.5),
-                                  label = list(set(paths['lval'].tolist() + paths['rval'].tolist())),
-                                  color = "blue"
-                                ),
+                                node = dict(pad = 15, thickness = 20, line = dict(color = "black", width = 0.5), label = labels, color = "blue"),
                                 link = dict(
-                                  source = [list(set(paths['lval'].tolist() + paths['rval'].tolist())).index(x) for x in paths['rval']],
-                                  target = [list(set(paths['lval'].tolist() + paths['rval'].tolist())).index(x) for x in paths['lval']],
+                                  source = [labels.index(x) for x in paths['rval']],
+                                  target = [labels.index(x) for x in paths['lval']],
                                   value = np.abs(paths['Estimate']).tolist(),
                                   label = paths['Estimate'].round(3).astype(str).tolist()
                                 ))])
@@ -165,3 +181,7 @@ if uploaded_file:
             if results_to_export:
                 xlsx_data = to_excel(results_to_export)
                 st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "driver_analysis.xlsx")
+            else:
+                st.warning("Please perform an analysis first.")
+    else:
+        st.info("👈 Use the sidebar to select your Target, tick your Drivers, and choose an Analysis type.")
