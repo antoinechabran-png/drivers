@@ -119,6 +119,21 @@ if uploaded_file:
                     st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h'))
                     results_to_export["RWA"] = rwa_df
 
+                elif analysis == "Shapley Values":
+                    st.subheader("Shapley Values (Game Theory Importance)")
+                    # We use a LinearExplainer for the OLS model
+                    explainer = shap.LinearExplainer(model, X_with_const)
+                    shap_values = explainer.shap_values(X_with_const)
+                    
+                    # Compute mean absolute SHAP values (excluding the constant term)
+                    # shap_values[:, 1:] aligns with the features in X
+                    mean_shap = np.abs(shap_values[:, 1:]).mean(axis=0)
+                    shap_df = pd.DataFrame({'Driver': features, 'Mean |SHAP Value|': mean_shap}).sort_values(by='Mean |SHAP Value|', ascending=False)
+                    
+                    st.plotly_chart(px.bar(shap_df, x='Mean |SHAP Value|', y='Driver', orientation='h', color='Mean |SHAP Value|', color_continuous_scale="Viridis"))
+                    st.write("This chart shows the average impact of each driver on the target variable across all respondents in the sub-target.")
+                    results_to_export["Shapley"] = shap_df
+
                 elif analysis == "Penalty Analysis (CATA)":
                     st.subheader("CATA Penalty Analysis")
                     cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
@@ -135,13 +150,11 @@ if uploaded_file:
 
                 elif analysis == "Kano Analysis":
                     st.subheader("Kano Strategic Classification")
-                    # Calculate Potential for Satisfaction (Reward) and Dissatisfaction (Penalty)
                     kano_list = []
                     for col in features:
                         reward = y[X[col] >= X[col].median()].mean() - y.mean()
                         penalty = y.mean() - y[X[col] < X[col].median()].mean()
                         
-                        # Classification logic
                         if reward > penalty and reward > 0.1: cat = "Delighter (Attractive)"
                         elif penalty > reward and penalty > 0.1: cat = "Must-have (Basic)"
                         elif abs(reward - penalty) < 0.1 and reward > 0.1: cat = "Linear (Performance)"
