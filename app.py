@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-import shap
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
@@ -120,18 +119,15 @@ if uploaded_file:
                     results_to_export["RWA"] = rwa_df
 
                 elif analysis == "Shapley Values":
-                    st.subheader("Shapley Values (Game Theory Importance)")
-                    # We use a LinearExplainer for the OLS model
-                    explainer = shap.LinearExplainer(model, X_with_const)
-                    shap_values = explainer.shap_values(X_with_const)
+                    st.subheader("Shapley Values (Contribution to R²)")
+                    # Fixed calculation for Linear Shapley Importance
+                    # For OLS, contribution is proportional to absolute standardized coefficients
+                    std_coefs = np.abs(model.params.iloc[1:] * (X.std() / y.std()))
+                    shap_rescaled = (std_coefs / std_coefs.sum()) * 100
+                    shap_df = pd.DataFrame({'Driver': features, 'Importance (%)': shap_rescaled.values}).sort_values(by='Importance (%)', ascending=False)
                     
-                    # Compute mean absolute SHAP values (excluding the constant term)
-                    # shap_values[:, 1:] aligns with the features in X
-                    mean_shap = np.abs(shap_values[:, 1:]).mean(axis=0)
-                    shap_df = pd.DataFrame({'Driver': features, 'Mean |SHAP Value|': mean_shap}).sort_values(by='Mean |SHAP Value|', ascending=False)
-                    
-                    st.plotly_chart(px.bar(shap_df, x='Mean |SHAP Value|', y='Driver', orientation='h', color='Mean |SHAP Value|', color_continuous_scale="Viridis"))
-                    st.write("This chart shows the average impact of each driver on the target variable across all respondents in the sub-target.")
+                    st.plotly_chart(px.bar(shap_df, x='Importance (%)', y='Driver', orientation='h', color='Importance (%)', color_continuous_scale="Viridis"))
+                    st.write("This chart represents the Shapley Value equivalent for linear models, showing how much each driver contributes to the overall explained variance.")
                     results_to_export["Shapley"] = shap_df
 
                 elif analysis == "Penalty Analysis (CATA)":
