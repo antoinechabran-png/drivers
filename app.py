@@ -23,6 +23,9 @@ def sanitize_name(name):
     return re.sub(r'[^a-zA-Z0-9]', '_', str(name))
 
 def run_rwa(X, y):
+    # Get direction from simple correlation first
+    directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
+    
     corr_matrix = X.corr()
     eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
     eigenvalues = np.maximum(eigenvalues, 1e-10)
@@ -32,7 +35,13 @@ def run_rwa(X, y):
     model = sm.OLS(y, sm.add_constant(transformed_X.T)).fit()
     raw_weights = (delta**2) @ (model.params.iloc[1:].values**2)
     rescaled_weights = (raw_weights / raw_weights.sum()) * 100
-    return pd.DataFrame({'Driver': X.columns, 'Weight (%)': rescaled_weights}).sort_values(by='Weight (%)', ascending=False)
+    
+    res = pd.DataFrame({
+        'Driver': X.columns, 
+        'Weight (%)': rescaled_weights,
+        'Direction': directions.map({1.0: 'Positive', -1.0: 'Negative', 0.0: 'Neutral'}).values
+    }).sort_values(by='Weight (%)', ascending=False)
+    return res
 
 # --- UI APP ---
 st.title("📊 Consumer Driver Analysis Suite")
@@ -109,25 +118,30 @@ if uploaded_file:
                     st.subheader("Linear Regression (Standardized Coefficients)")
                     std_coefs = model.params.iloc[1:] * (X.std() / y.std())
                     reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
-                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score'))
+                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', color_continuous_scale="RdYlGn"))
                     results_to_export["Regression"] = reg_df
 
                 elif analysis == "RWA":
                     st.subheader("Relative Weight Analysis (RWA)")
                     rwa_df = run_rwa(X, y)
-                    st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h'))
+                    st.plotly_chart(px.bar(rwa_df, x='Weight (%)', y='Driver', orientation='h', 
+                                         color='Direction', color_discrete_map={'Positive': '#2ca02c', 'Negative': '#d62728', 'Neutral': 'gray'}))
                     results_to_export["RWA"] = rwa_df
 
                 elif analysis == "Shapley Values":
                     st.subheader("Shapley Values (Contribution to R²)")
-                    # Fixed calculation for Linear Shapley Importance
-                    # For OLS, contribution is proportional to absolute standardized coefficients
-                    std_coefs = np.abs(model.params.iloc[1:] * (X.std() / y.std()))
-                    shap_rescaled = (std_coefs / std_coefs.sum()) * 100
-                    shap_df = pd.DataFrame({'Driver': features, 'Importance (%)': shap_rescaled.values}).sort_values(by='Importance (%)', ascending=False)
+                    raw_std_coefs = model.params.iloc[1:] * (X.std() / y.std())
+                    std_coefs_abs = np.abs(raw_std_coefs)
+                    shap_rescaled = (std_coefs_abs / std_coefs_abs.sum()) * 100
                     
-                    st.plotly_chart(px.bar(shap_df, x='Importance (%)', y='Driver', orientation='h', color='Importance (%)', color_continuous_scale="Viridis"))
-                    st.write("This chart represents the Shapley Value equivalent for linear models, showing how much each driver contributes to the overall explained variance.")
+                    shap_df = pd.DataFrame({
+                        'Driver': features, 
+                        'Importance (%)': shap_rescaled.values,
+                        'Direction': np.where(raw_std_coefs > 0, 'Positive', 'Negative')
+                    }).sort_values(by='Importance (%)', ascending=False)
+                    
+                    st.plotly_chart(px.bar(shap_df, x='Importance (%)', y='Driver', orientation='h', 
+                                         color='Direction', color_discrete_map={'Positive': '#2ca02c', 'Negative': '#d62728'}))
                     results_to_export["Shapley"] = shap_df
 
                 elif analysis == "Penalty Analysis (CATA)":
